@@ -16,7 +16,7 @@ REPO_NAME="${REPO_NAME:-prime-canon-artifact-pack-mq-$RUN_ID}"
 MQ_REPO="${MQ_REPO:-$ORG_SLUG/$REPO_NAME}"
 WORKFLOW_FILE="publish-guard-check.yml"
 WORKFLOW_NAME="publish-guard-check"
-PROOF_BRANCH="mq-proof-$RUN_ID"
+PROOF_BRANCH="cycle-2/mq-proof-$RUN_ID"
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 
 cleanup() {
@@ -49,6 +49,7 @@ git push -u mq "$PROOF_BRANCH"
 
 STATUS=""
 CONCLUSION=""
+SEEN_PUSH_RUN="false"
 for _ in $(seq 1 36); do
   RUN_JSON="$(gh run list --repo "$MQ_REPO" --workflow "$WORKFLOW_FILE" --branch "$PROOF_BRANCH" --event push --json status,conclusion,headSha --limit 20 2>/dev/null || echo '[]')"
   STATUS="$(python3 - <<'PY' "$RUN_JSON" "$PR_HEAD_SHA"
@@ -67,12 +68,20 @@ found = next((r for r in runs if r.get("headSha")==head), None)
 print(found.get("conclusion","") if found else "")
 PY
 )"
+  if [ -n "${STATUS:-}" ]; then
+    SEEN_PUSH_RUN="true"
+  fi
   echo "proof-branch push $WORKFLOW_NAME status=${STATUS:-none} conclusion=${CONCLUSION:-none}"
   if [ "$STATUS" = "completed" ]; then
     break
   fi
   sleep 5
 done
+
+if [ "$SEEN_PUSH_RUN" != "true" ]; then
+  echo "$WORKFLOW_NAME never triggered on push for $PROOF_BRANCH; check workflow branch filters" >&2
+  exit 1
+fi
 
 if [ "$STATUS" != "completed" ] || [ "$CONCLUSION" != "success" ]; then
   echo "$WORKFLOW_NAME did not complete successfully on proof-branch push in $MQ_REPO" >&2
