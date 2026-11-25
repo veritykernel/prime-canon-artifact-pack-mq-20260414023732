@@ -26,3 +26,7 @@ jobs:
           python -m pip install pyyaml jsonschema
       - name: Validate prime canon pack
         run: python scripts/validate_pack.py .
+      - name: Verify frozen publication inputs
+        run: python scripts/check_export_prep.py . subject-0001
+      - name: Test canon security boundaries
+        run: PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v

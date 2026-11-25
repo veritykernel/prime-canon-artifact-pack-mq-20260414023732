@@ -8,6 +8,7 @@ from pathlib import Path
 import yaml
 
 from schema_contract import choose_enum, ensure_enum, ensure_required_fields, validate_instance
+from security_guards import evaluate_evidence, require_new_paths, write_new_yaml
 
 EVIDENCE_LINK_KIND = "PRIME_CANON_EVIDENCE_LINK_V1"
 ADMISSIBILITY_KIND = "PRIME_CANON_ADMISSIBILITY_DECISION_V1"
@@ -78,6 +79,15 @@ def main() -> None:
 
     corpus = yaml.safe_load(corpus_index_path.read_text(encoding="utf-8"))
     corpus_id = corpus["spec"]["corpus_id"]
+    manifest = yaml.safe_load((repo / "control" / "repo.manifest.yaml").read_text(encoding="utf-8"))
+    profile = yaml.safe_load((repo / "control" / "admissibility" / "core-default.yaml").read_text(encoding="utf-8"))
+    profile_id = profile["metadata"]["object_id"]
+    if manifest["spec"]["default_admissibility_profile_ref"] != profile_id or profile["spec"]["profile_id"] != profile_id:
+        raise SystemExit("default admissibility profile identity mismatch")
+    try:
+        require_new_paths([receipt_dir / f"admissibility-{p.stem.replace('claim-', '')}.yaml" for p in claim_files])
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     now = utc_now()
 
     built_link_ids = []
@@ -85,12 +95,16 @@ def main() -> None:
 
     for claim_path in claim_files:
         claim = yaml.safe_load(claim_path.read_text(encoding="utf-8"))
+        try:
+            met_burdens, unmet_burdens, reasons, evidence_units, replayable = evaluate_evidence(repo, subject_slug, claim, profile)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
         seq = claim_path.stem.replace("claim-", "")
         claim_id = claim["spec"]["claim_id"]
         source_refs = list(claim["attributes"]["lineage"].get("source_refs", []))
         source_unit_refs = list(claim["attributes"]["lineage"].get("source_unit_refs", []))
         evidence_class = claim["attributes"]["evidence"].get("evidence_class", "direct_quote")
-        sufficiency_status = claim["attributes"]["evidence"].get("sufficiency_status", "insufficient")
+        sufficiency_status = "sufficient" if not unmet_burdens else "insufficient"
         burden_level = claim["attributes"]["evidence"].get("burden_level", "medium")
         replayability_class = claim["attributes"]["evidence"].get("replayability_class", "high")
         semantic_density = float(claim["attributes"]["semantic"].get("semantic_density", 0.80))
@@ -142,7 +156,7 @@ def main() -> None:
                 },
                 "evidence": {
                     "evidence_class": evidence_class,
-                    "evidence_ref_count": max(len(source_refs), 1),
+                    "evidence_ref_count": 1,
                     "burden_level": burden_level,
                     "sufficiency_status": sufficiency_status,
                     "replayability_class": replayability_class,
@@ -196,7 +210,7 @@ def main() -> None:
                 "support_strength": support_strength,
                 "source_trust_class": source_trust_class,
                 "admissibility_weight": admissibility_weight,
-                "replayable": True,
+                "replayable": replayable,
             },
         }
 
@@ -205,34 +219,6 @@ def main() -> None:
 
         decision_id = f"pc.admissibility_decision.{subject_slug}.{seq}"
         decision_rel_path = f"receipts/immutable/{subject_slug}/admissibility-{seq}.yaml"
-
-        met_burdens = []
-        unmet_burdens = []
-        reasons = []
-
-        if source_refs:
-            met_burdens.append("source_refs_present")
-            reasons.append("claim carries source_refs lineage")
-        else:
-            unmet_burdens.append("source_refs_present")
-
-        if source_unit_refs:
-            met_burdens.append("source_unit_refs_present")
-            reasons.append("claim carries source_unit_refs lineage")
-        else:
-            unmet_burdens.append("source_unit_refs_present")
-
-        if sufficiency_status == "sufficient":
-            met_burdens.append("evidence_status_sufficient")
-            reasons.append("claim evidence sufficiency_status is sufficient")
-        else:
-            unmet_burdens.append("evidence_status_sufficient")
-
-        if evidence_class == "direct_quote":
-            met_burdens.append("direct_quote_support")
-            reasons.append("claim evidence_class is direct_quote")
-        else:
-            unmet_burdens.append("direct_quote_support")
 
         reasons.append(f"linked_evidence_ref={link_id}")
 
@@ -265,7 +251,7 @@ def main() -> None:
                 },
                 "evidence": {
                     "evidence_class": evidence_class,
-                    "evidence_ref_count": max(len(source_refs), 1),
+                    "evidence_ref_count": 1,
                     "burden_level": burden_level,
                     "sufficiency_status": sufficiency_status,
                     "replayability_class": replayability_class,
@@ -313,7 +299,7 @@ def main() -> None:
             "spec": {
                 "decision_id": decision_id,
                 "target_claim_ref": claim_id,
-                "profile_ref": "pc.admissibility.default.v1",
+                "profile_ref": profile_id,
                 "pass_fail": pass_fail,
                 "met_burdens": met_burdens,
                 "unmet_burdens": unmet_burdens,
@@ -327,7 +313,7 @@ def main() -> None:
         validate_instance(repo, admissibility)
 
         (repo / link_rel_path).write_text(yaml.safe_dump(evidence_link, sort_keys=False), encoding="utf-8")
-        (repo / decision_rel_path).write_text(yaml.safe_dump(admissibility, sort_keys=False), encoding="utf-8")
+        write_new_yaml(repo / decision_rel_path, admissibility)
 
         built_link_ids.append(link_id)
         built_decision_ids.append(decision_id)

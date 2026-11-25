@@ -10,6 +10,7 @@ if [ ! -x .venv/bin/python3 ]; then
 fi
 source .venv/bin/activate
 SUBJECT_SLUG="${1:-subject-0001}"
+REVIEW_ATTESTATION="${2:?usage: promote_nodes_and_current_state_commit.sh SUBJECT_SLUG REVIEW_ATTESTATION.json}"
 if [ ! -f "receipts/immutable/$SUBJECT_SLUG/promotion-readiness-packet.yaml" ]; then
   echo "missing promotion readiness packet for $SUBJECT_SLUG" >&2
   exit 1
@@ -22,7 +23,7 @@ if [ ! -f "replay/manifests/$SUBJECT_SLUG/promotion-readiness-replay.yaml" ]; th
   echo "missing promotion readiness replay manifest for $SUBJECT_SLUG" >&2
   exit 1
 fi
-python3 scripts/promote_nodes_and_current_state.py "$REPO" "$SUBJECT_SLUG"
+python3 scripts/promote_nodes_and_current_state.py "$REPO" "$SUBJECT_SLUG" "$REVIEW_ATTESTATION"
 python3 scripts/validate_pack.py .
 git diff --exit-code -- control schemas
 rm -rf scripts/__pycache__

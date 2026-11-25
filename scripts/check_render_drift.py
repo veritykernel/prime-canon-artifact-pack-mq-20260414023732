@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 
 from schema_contract import ensure_required_fields, validate_instance
+from security_guards import require_new_paths, write_new_yaml
 
 DRIFT_KIND = "PRIME_CANON_RENDER_DRIFT_RECEIPT_V1"
 
@@ -31,6 +32,10 @@ def main() -> None:
     view_path = repo / "views" / "current" / f"{subject_slug}.yaml"
     execution_path = repo / "receipts" / "immutable" / subject_slug / "render-execution.yaml"
     drift_path = repo / "receipts" / "immutable" / subject_slug / "render-drift.yaml"
+    try:
+        require_new_paths([drift_path])
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     corpus = load_yaml(corpus_index_path)
     view = load_yaml(view_path)
@@ -146,7 +151,11 @@ def main() -> None:
 
     ensure_required_fields(repo, DRIFT_KIND, drift_receipt["spec"])
     validate_instance(repo, drift_receipt)
-    drift_path.write_text(yaml.safe_dump(drift_receipt, sort_keys=False), encoding="utf-8")
+    try:
+        require_new_paths([drift_path])
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    write_new_yaml(drift_path, drift_receipt)
 
     view["metadata"]["updated_at"] = now
     view["attributes"]["temporal"]["reduced_at"] = now

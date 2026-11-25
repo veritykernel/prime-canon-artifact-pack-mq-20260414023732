@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
+from security_guards import require_new_paths, sha256_file, verify_human_review, verify_manifest_inputs, write_new_yaml
 
 NODE_KIND = "PRIME_CANON_NODE_V1"
 VIEW_KIND = "PRIME_CANON_CURRENT_STATE_VIEW_V1"
@@ -26,6 +27,7 @@ def claim_seq_from_path(path: Path) -> str:
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
     subject_slug = sys.argv[2] if len(sys.argv) > 2 else "subject-0001"
+    review_attestation = Path(sys.argv[3]).resolve() if len(sys.argv) > 3 else None
 
     corpus_index_path = repo / "canon" / "corpora" / subject_slug / "index.yaml"
     claim_dir = repo / "canon" / "candidate_claims" / subject_slug
@@ -50,9 +52,6 @@ def main() -> None:
     if not replay_manifest_path.exists():
         raise SystemExit(f"missing replay manifest: {replay_manifest_path}")
 
-    node_dir.mkdir(parents=True, exist_ok=True)
-    current_view_path.parent.mkdir(parents=True, exist_ok=True)
-
     corpus = yaml.safe_load(corpus_index_path.read_text(encoding="utf-8"))
     packet = yaml.safe_load(packet_path.read_text(encoding="utf-8"))
     readiness_summary = yaml.safe_load(readiness_summary_path.read_text(encoding="utf-8"))
@@ -62,6 +61,14 @@ def main() -> None:
         raise SystemExit("promotion readiness packet is not ready=true")
     if packet["spec"].get("blockers"):
         raise SystemExit(f"promotion readiness packet still has blockers: {packet['spec']['blockers']}")
+    try:
+        verify_manifest_inputs(repo, subject_slug, replay_manifest_path, replay_manifest, packet, readiness_summary)
+        reviewer_ref = verify_human_review(repo, subject_slug, replay_manifest_path, packet, review_attestation)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    node_dir.mkdir(parents=True, exist_ok=True)
+    current_view_path.parent.mkdir(parents=True, exist_ok=True)
 
     corpus_id = corpus["spec"]["corpus_id"]
     now = utc_now()
@@ -90,6 +97,13 @@ def main() -> None:
     missing_links = [claim_id for claim_id in target_claim_ids if claim_id not in evidence_links_by_claim]
     if missing_links:
         raise SystemExit(f"missing evidence links for target refs: {missing_links}")
+
+    receipt_paths = [repo / "receipts" / "immutable" / subject_slug / f"promotion-node-{claim_seq_from_path(claim_paths_by_id[c])}.yaml" for c in target_claim_ids]
+    receipt_paths.append(receipt_dir / "promotion-lane-summary.yaml")
+    try:
+        require_new_paths(receipt_paths)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     node_ids = []
     node_receipt_ids = []
@@ -192,12 +206,12 @@ def main() -> None:
                 "decision_receipt_id": receipt_id,
                 "target_ref": claim_id,
                 "decision_type": choose_enum(repo, RECEIPT_KIND, "decision_type", "promote", "include"),
-                "deciding_surface": choose_enum(repo, RECEIPT_KIND, "deciding_surface", "compiler", "ci"),
+                "deciding_surface": choose_enum(repo, RECEIPT_KIND, "deciding_surface", "human", "ci"),
                 "rationale": f"claim {claim_id} promoted into canon node {node_id} from ready promotion packet {packet_id}",
                 "cited_receipt_refs": [packet_id, readiness_summary_id],
-                "cited_object_refs": [claim_id, link_id, replay_manifest_id],
+                "cited_object_refs": [claim_id, link_id, replay_manifest_id, f"sha256:{sha256_file(review_attestation)}"],
                 "jurisdiction_ref": "pc.jurisdiction.human-reviewer",
-                "reviewer_refs": [],
+                "reviewer_refs": [reviewer_ref],
                 "blocker_state": choose_enum(repo, RECEIPT_KIND, "blocker_state", "none", "present_resolved"),
                 "route_outcome": choose_enum(repo, RECEIPT_KIND, "route_outcome", "promotion_lane", "candidate_pool"),
             },
@@ -293,7 +307,7 @@ def main() -> None:
         ensure_required_fields(repo, NODE_KIND, node["spec"])
         validate_instance(repo, node)
 
-        (repo / receipt_rel_path).write_text(yaml.safe_dump(receipt, sort_keys=False), encoding="utf-8")
+        write_new_yaml(repo / receipt_rel_path, receipt)
         (repo / node_rel_path).write_text(yaml.safe_dump(node, sort_keys=False), encoding="utf-8")
 
         node_ids.append(node_id)
@@ -447,12 +461,12 @@ def main() -> None:
             "decision_receipt_id": lane_summary_id,
             "target_ref": view_id,
             "decision_type": choose_enum(repo, RECEIPT_KIND, "decision_type", "promote", "include"),
-            "deciding_surface": choose_enum(repo, RECEIPT_KIND, "deciding_surface", "compiler", "ci"),
+            "deciding_surface": choose_enum(repo, RECEIPT_KIND, "deciding_surface", "human", "ci"),
             "rationale": f"promoted {len(node_ids)} ready candidate claims into canon nodes and generated current state view {view_id}",
             "cited_receipt_refs": node_receipt_ids + [packet_id, readiness_summary_id],
-            "cited_object_refs": target_claim_ids + node_ids + [view_id, replay_manifest_id],
+            "cited_object_refs": target_claim_ids + node_ids + [view_id, replay_manifest_id, f"sha256:{sha256_file(review_attestation)}"],
             "jurisdiction_ref": "pc.jurisdiction.human-reviewer",
-            "reviewer_refs": [],
+            "reviewer_refs": [reviewer_ref],
             "blocker_state": choose_enum(repo, RECEIPT_KIND, "blocker_state", "none", "present_resolved"),
             "route_outcome": choose_enum(repo, RECEIPT_KIND, "route_outcome", "promotion_lane", "deferred"),
         },
@@ -462,7 +476,7 @@ def main() -> None:
     validate_instance(repo, lane_summary)
 
     (repo / view_rel_path).write_text(yaml.safe_dump(current_view, sort_keys=False), encoding="utf-8")
-    (repo / lane_summary_rel_path).write_text(yaml.safe_dump(lane_summary, sort_keys=False), encoding="utf-8")
+    write_new_yaml(repo / lane_summary_rel_path, lane_summary)
 
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["temporal"]["reduced_at"] = now

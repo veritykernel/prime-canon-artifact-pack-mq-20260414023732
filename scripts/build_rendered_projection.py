@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
+from security_guards import require_new_paths, write_new_yaml
 
 PROFILE_KIND = "PRIME_CANON_RENDER_PROFILE_V1"
 PLAN_KIND = "PRIME_CANON_RENDER_PLAN_V1"
@@ -40,6 +41,10 @@ def main() -> None:
     node_dir = repo / "canon" / "nodes" / subject_slug
     receipt_dir = repo / "receipts" / "immutable" / subject_slug
     rendered_path = repo / "views" / "rendered" / f"{subject_slug}.md"
+    try:
+        require_new_paths([receipt_dir / "render-execution.yaml", receipt_dir / "render-drift.yaml"])
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     profile_cfg_path = repo / "control" / "render" / "render-profile.default.yaml"
     order_cfg_path = repo / "control" / "render" / "render-order.default.yaml"
@@ -528,8 +533,13 @@ def main() -> None:
     ensure_required_fields(repo, DRIFT_KIND, drift_receipt["spec"])
     validate_instance(repo, drift_receipt)
 
-    (repo / execution_receipt["attributes"]["identity"]["canonical_home"]).write_text(yaml.safe_dump(execution_receipt, sort_keys=False), encoding="utf-8")
-    (repo / drift_receipt["attributes"]["identity"]["canonical_home"]).write_text(yaml.safe_dump(drift_receipt, sort_keys=False), encoding="utf-8")
+    output_paths = [repo / execution_receipt["attributes"]["identity"]["canonical_home"], repo / drift_receipt["attributes"]["identity"]["canonical_home"]]
+    try:
+        require_new_paths(output_paths)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    write_new_yaml(output_paths[0], execution_receipt)
+    write_new_yaml(output_paths[1], drift_receipt)
 
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["temporal"]["reduced_at"] = now
