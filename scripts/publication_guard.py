@@ -155,7 +155,7 @@ def _expected_rendered_bytes(repo: Path, revision: str, subject: str, view: dict
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def validated_publication(repo: Path, subject: str) -> tuple[Path, Path, str]:
+def _verified_source_context(repo: Path, subject: str) -> tuple[Path, str, dict]:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", subject):
         raise ValueError("invalid subject slug")
     relative_paths = [
@@ -203,6 +203,17 @@ def validated_publication(repo: Path, subject: str) -> tuple[Path, Path, str]:
         raise ValueError("render drift is not in sync")
     if frozen[relative_paths[0]] != _expected_rendered_bytes(repo, revision, subject, view, execution, profile):
         raise ValueError("rendered source is not derived from governed nodes")
+    return source, source_sha, targets
+
+
+def validated_source(repo: Path, subject: str) -> tuple[Path, str]:
+    """Check governed source bytes without claiming destination readiness."""
+    source, source_sha, _ = _verified_source_context(repo, subject)
+    return source, source_sha
+
+
+def validated_publication(repo: Path, subject: str) -> tuple[Path, Path, str]:
+    source, source_sha, targets = _verified_source_context(repo, subject)
     target_text = targets["subjects"][subject]["rendered_markdown_path"]
     destination = Path(target_text)
     if not destination.is_absolute() or destination == source:
