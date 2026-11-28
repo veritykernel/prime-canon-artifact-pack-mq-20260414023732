@@ -12,10 +12,8 @@ from pathlib import Path
 import yaml
 
 
-def _load(path: Path) -> dict:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"missing regular publication input: {path}")
-    obj = yaml.safe_load(path.read_text(encoding="utf-8"))
+def _load(data: bytes, path: Path) -> dict:
+    obj = yaml.safe_load(data.decode("utf-8"))
     if not isinstance(obj, dict):
         raise ValueError(f"invalid publication input: {path}")
     return obj
@@ -25,6 +23,66 @@ def _no_symlink_components(path: Path) -> None:
     for parent in (path, *path.parents):
         if parent.is_symlink():
             raise ValueError(f"symlinked publication path: {parent}")
+
+
+def _open_directory(path: Path, *, require_private: bool = False) -> int:
+    absolute = Path(os.path.abspath(path))
+    if len(absolute.parts) > 1 and absolute.parts[1] in {"var", "tmp"}:
+        root_name = absolute.parts[1]
+        system_root = f"/private/{root_name}"
+        if os.path.islink(f"/{root_name}") and os.path.realpath(f"/{root_name}") == system_root:
+            absolute = Path(system_root, *absolute.parts[2:])
+    directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in absolute.parts[1:]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            details = os.fstat(child)
+            if require_private and details.st_mode & 0o022:
+                # Root-owned sticky system roots such as /Users/Shared are
+                # safe ancestors; a writable non-sticky stage is not.
+                if not (details.st_uid == 0 and details.st_mode & stat.S_ISVTX):
+                    os.close(child)
+                    raise ValueError(f"writable publication directory: {path}")
+            os.close(directory)
+            directory = child
+        result = directory
+        directory = -1
+        return result
+    finally:
+        if directory >= 0:
+            os.close(directory)
+
+
+def _read_regular_no_follow(path: Path) -> bytes:
+    directory = _open_directory(path.parent)
+    try:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError(f"missing regular publication input: {path}")
+            return stream.read()
+    finally:
+        os.close(directory)
+
+
+def _frozen_bytes(repo: Path, revision: str, relative: str) -> bytes:
+    path = repo / relative
+    try:
+        committed = subprocess.run(
+            ["/usr/bin/git", "-C", str(repo), "show", f"{revision}:{relative}"],
+            check=True, capture_output=True,
+        ).stdout
+        actual = _read_regular_no_follow(path)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError(f"missing frozen publication input: {relative}") from exc
+    if actual != committed:
+        raise ValueError("publication inputs differ from the frozen Git revision")
+    return committed
+
+
+def open_trusted_destination_parent(destination: Path) -> int:
+    """Pin a destination directory and reject writable redirect ancestors."""
+    return _open_directory(destination.parent, require_private=True)
 
 
 def validated_publication(repo: Path, subject: str) -> tuple[Path, Path, str]:
@@ -38,23 +96,21 @@ def validated_publication(repo: Path, subject: str) -> tuple[Path, Path, str]:
         "control/render/render-profile.default.yaml",
         "control/publish/publish-targets.default.yaml",
     ]
-    for relative in relative_paths:
-        path = repo / relative
-        _no_symlink_components(path)
-        tracked = subprocess.run(["git", "-C", str(repo), "ls-files", "--error-unmatch", "--", relative], capture_output=True)
-        if tracked.returncode != 0:
-            raise ValueError(f"publication input is not tracked: {relative}")
-    clean = subprocess.run(["git", "-C", str(repo), "diff", "--quiet", "HEAD", "--", *relative_paths])
-    if clean.returncode != 0:
-        raise ValueError("publication inputs differ from the frozen Git revision")
+    revision = subprocess.run(
+        ["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    if re.fullmatch(r"[0-9a-f]{40,64}", revision) is None:
+        raise ValueError("invalid frozen Git revision")
+    frozen = {relative: _frozen_bytes(repo, revision, relative) for relative in relative_paths}
 
     source = repo / relative_paths[0]
-    view = _load(repo / relative_paths[1])
-    execution = _load(repo / relative_paths[2])
-    drift = _load(repo / relative_paths[3])
-    profile = _load(repo / relative_paths[4])
-    targets = _load(repo / relative_paths[5])
-    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    view = _load(frozen[relative_paths[1]], repo / relative_paths[1])
+    execution = _load(frozen[relative_paths[2]], repo / relative_paths[2])
+    drift = _load(frozen[relative_paths[3]], repo / relative_paths[3])
+    profile = _load(frozen[relative_paths[4]], repo / relative_paths[4])
+    targets = _load(frozen[relative_paths[5]], repo / relative_paths[5])
+    source_sha = hashlib.sha256(frozen[relative_paths[0]]).hexdigest()
     view_id = view["metadata"]["object_id"]
     expected_source = f"views/rendered/{subject}.md"
     e = execution["spec"]
@@ -86,11 +142,7 @@ def validated_publication(repo: Path, subject: str) -> tuple[Path, Path, str]:
 
 
 def read_verified_source(source: Path, expected_sha: str) -> bytes:
-    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd, "rb") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-            raise ValueError("rendered source is not a regular file")
-        data = stream.read()
+    data = _read_regular_no_follow(source)
     if hashlib.sha256(data).hexdigest() != expected_sha:
         raise ValueError("rendered source changed during publication")
     return data

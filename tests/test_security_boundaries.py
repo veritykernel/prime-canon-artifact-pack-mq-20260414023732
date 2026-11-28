@@ -24,6 +24,51 @@ def git(repo: Path, *args: str) -> None:
 
 
 class SecurityBoundaryTests(unittest.TestCase):
+    def test_publisher_uses_frozen_bytes_and_holds_writable_stage(self):
+        paths = [
+            "views/rendered/subject-0001.md",
+            "views/current/subject-0001.yaml",
+            "receipts/immutable/subject-0001/render-execution.yaml",
+            "receipts/immutable/subject-0001/render-drift.yaml",
+            "control/render/render-profile.default.yaml",
+            "control/publish/publish-targets.default.yaml",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve() / "repo"
+            stage = Path(directory).resolve() / "stage"
+            stage.mkdir(mode=0o700)
+            for relative in paths:
+                dest = repo / relative
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(REPO / relative, dest)
+            targets = repo / paths[-1]
+            target_data = yaml.safe_load(targets.read_text(encoding="utf-8"))
+            destination = stage / "subject-0001.rendered.md"
+            target_data["subjects"]["subject-0001"]["rendered_markdown_path"] = str(destination)
+            targets.write_text(yaml.safe_dump(target_data), encoding="utf-8")
+            git(repo, "init", "-q")
+            git(repo, "config", "user.name", "Test")
+            git(repo, "config", "user.email", "test@example.invalid")
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "frozen inputs")
+            command = [sys.executable, str(REPO / "scripts/publish_verified.py"), str(repo), "subject-0001"]
+            published = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(published.returncode, 0, published.stderr)
+            expected = (repo / paths[0]).read_bytes()
+            self.assertEqual(destination.read_bytes(), expected)
+            stage.chmod(0o775)
+            denied = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(denied.returncode, 0)
+            self.assertIn("writable publication directory", denied.stderr)
+            self.assertEqual(destination.read_bytes(), expected)
+            stage.chmod(0o700)
+            destination.unlink()
+            stage.rmdir()
+            stage.symlink_to(repo, target_is_directory=True)
+            redirected = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(redirected.returncode, 0)
+            self.assertFalse((repo / destination.name).exists())
+
     def test_publication_rechecks_source_bytes_and_git_state(self):
         paths = [
             "views/rendered/subject-0001.md",
