@@ -25,7 +25,7 @@ def _no_symlink_components(path: Path) -> None:
             raise ValueError(f"symlinked publication path: {parent}")
 
 
-def _open_directory(path: Path, *, require_private: bool = False) -> int:
+def _open_directory(path: Path, *, require_private: bool = False, create: bool = False) -> int:
     absolute = Path(os.path.abspath(path))
     if len(absolute.parts) > 1 and absolute.parts[1] in {"var", "tmp"}:
         root_name = absolute.parts[1]
@@ -35,7 +35,13 @@ def _open_directory(path: Path, *, require_private: bool = False) -> int:
     directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     try:
         for part in absolute.parts[1:]:
-            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, mode=0o700, dir_fd=directory)
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
             details = os.fstat(child)
             if require_private and details.st_mode & 0o022:
                 # Root-owned sticky system roots such as /Users/Shared are
@@ -85,6 +91,70 @@ def open_trusted_destination_parent(destination: Path) -> int:
     return _open_directory(destination.parent, require_private=True)
 
 
+def _expected_rendered_bytes(repo: Path, revision: str, subject: str, view: dict,
+                             execution: dict, profile: dict) -> bytes:
+    """Replay the maintained render template from frozen governed nodes."""
+    if profile.get("default_output_format") != "markdown" or profile.get("target_projection_flag") != "rendered_text":
+        raise ValueError("unsupported render profile for publication")
+    if profile.get("section_strategy") != "linear_nodes" or profile.get("ordering_strategy") != "active_node_order":
+        raise ValueError("unsupported render order for publication")
+    order = _load(_frozen_bytes(repo, revision, "control/render/render-order.default.yaml"),
+                  repo / "control/render/render-order.default.yaml")
+    targets = _load(_frozen_bytes(repo, revision, "control/render/render-targets.default.yaml"),
+                    repo / "control/render/render-targets.default.yaml")
+    redaction = _load(_frozen_bytes(repo, revision, "control/render/render-redaction.default.yaml"),
+                      repo / "control/render/render-redaction.default.yaml")
+    if order.get("ordering_mode") != "active_node_refs" or redaction.get("policy_mode") != "none":
+        raise ValueError("unsupported render policy for publication")
+    if "markdown" not in targets.get("allowed_output_formats", []) or "rendered_text" not in targets.get("allowed_projection_flags", []):
+        raise ValueError("render target policy disallows publication")
+    node_ids = view["spec"].get("active_node_refs", [])
+    if not node_ids or len(node_ids) != len(set(node_ids)):
+        raise ValueError("invalid active node set")
+    if execution["spec"].get("rendered_node_count") != len(node_ids):
+        raise ValueError("render receipt node count mismatch")
+    if execution["spec"].get("cited_object_refs") != node_ids + [view["metadata"]["object_id"]]:
+        raise ValueError("render receipt does not cite the active nodes")
+    corpus_id = view["spec"]["scope_ref"]
+    view_id = view["metadata"]["object_id"]
+    if view["spec"].get("view_id") != view_id:
+        raise ValueError("current view identity mismatch")
+    fields = profile.get("include_metadata_fields", [])
+    if not isinstance(fields, list) or any(field not in {"corpus_id", "current_state_view", "generated_at"} for field in fields):
+        raise ValueError("unsupported render metadata field")
+    style = profile.get("heading_style")
+    if style not in {"numbered", "title_only"}:
+        raise ValueError("unsupported heading style")
+    metadata = {"corpus_id": corpus_id, "current_state_view": view_id,
+                "generated_at": execution["spec"]["generated_at"]}
+    lines = [f"# {subject} rendered canon", ""]
+    for field in fields:
+        lines.append(f"- {field}: `{metadata[field]}`")
+    lines += [f"- active_node_count: `{len(node_ids)}`", "", "## Promoted canon nodes", ""]
+    for index, node_id in enumerate(node_ids, start=1):
+        prefix = f"pc.canon_node.{subject}."
+        if not isinstance(node_id, str) or not node_id.startswith(prefix):
+            raise ValueError("active node identity mismatch")
+        sequence = node_id[len(prefix):]
+        if not re.fullmatch(r"[0-9]{4,}", sequence):
+            raise ValueError("invalid active node sequence")
+        relative = f"canon/nodes/{subject}/node-{sequence}.yaml"
+        node = _load(_frozen_bytes(repo, revision, relative), repo / relative)
+        if node["metadata"]["object_id"] != node_id or node["spec"]["canon_node_id"] != node_id:
+            raise ValueError("active node file identity mismatch")
+        if node["spec"].get("state") != "promoted":
+            raise ValueError("active node is not promoted")
+        body = node["spec"]["canonical_body"]
+        if not isinstance(body, str):
+            raise ValueError("invalid canonical body")
+        lines.append(f"{index}. {body}" if style == "numbered" else f"- {body}")
+    if profile.get("include_receipt_footer"):
+        lines += ["", "## Projection receipts", "",
+                  f"- render_profile_ref: `{profile['profile_id']}`",
+                  f"- render_plan_ref: `pc.render_plan.{subject}.default`"]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 def validated_publication(repo: Path, subject: str) -> tuple[Path, Path, str]:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", subject):
         raise ValueError("invalid subject slug")
@@ -131,10 +201,16 @@ def validated_publication(repo: Path, subject: str) -> tuple[Path, Path, str]:
         raise ValueError("rendered source hash differs from execution or drift receipt")
     if d["drift_status"] != "in_sync" or d["blocker"] is not False or d["recommended_route"] != "export_prep":
         raise ValueError("render drift is not in sync")
+    if frozen[relative_paths[0]] != _expected_rendered_bytes(repo, revision, subject, view, execution, profile):
+        raise ValueError("rendered source is not derived from governed nodes")
     target_text = targets["subjects"][subject]["rendered_markdown_path"]
     destination = Path(target_text)
     if not destination.is_absolute() or destination == source:
         raise ValueError("invalid publication destination")
+    trusted_root_text = os.environ.get("PRIME_PUBLISH_ROOT", "")
+    trusted_root = Path(trusted_root_text)
+    if not trusted_root.is_absolute() or destination.parent != trusted_root or destination.name != f"{subject}.rendered.md":
+        raise ValueError("publication destination is outside the operator-bound root")
     _no_symlink_components(destination)
     if destination.exists() and not destination.is_file():
         raise ValueError("publication destination is not a regular file")

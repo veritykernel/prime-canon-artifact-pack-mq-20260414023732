@@ -6,16 +6,18 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import stat
 import subprocess
 from pathlib import Path
 
 import yaml
 
+from publication_guard import _frozen_bytes, _open_directory, _read_regular_no_follow
+
 
 def sha256_file(path: Path) -> str:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"expected a regular file: {path}")
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashlib.sha256(_read_regular_no_follow(path)).hexdigest()
 
 
 def require_new_paths(paths: list[Path]) -> None:
@@ -27,37 +29,78 @@ def require_new_paths(paths: list[Path]) -> None:
 
 
 def write_new_yaml(path: Path, obj: dict) -> None:
-    """O_EXCL prevents even a last-moment replacement or symlink traversal."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    fd = os.open(path, flags, 0o644)
+    """Create an immutable object through a pinned, private directory fd."""
+    parent = _open_directory(path.parent, require_private=True, create=True)
+    created = None
     try:
+        fd = os.open(path.name, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                     0o644, dir_fd=parent)
+        created = os.fstat(fd)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                yaml.safe_dump(obj, out, sort_keys=False)
+                out.flush()
+                os.fsync(out.fileno())
+            os.fsync(parent)
+        except BaseException:
+            try:
+                observed = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+                if created and (observed.st_dev, observed.st_ino) == (created.st_dev, created.st_ino):
+                    os.unlink(path.name, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+            raise
+    finally:
+        os.close(parent)
+
+
+def replace_yaml_if_unchanged(path: Path, obj: dict, old_bytes: bytes | None) -> None:
+    """Replace a mutable projection only if its pinned parent and old bytes agree."""
+    parent = _open_directory(path.parent, require_private=True, create=True)
+    temporary = f".prime-update-{secrets.token_hex(12)}"
+    try:
+        try:
+            current = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+        except FileNotFoundError:
+            current = None
+        if current is None:
+            if old_bytes is not None:
+                raise ValueError(f"mutable output disappeared: {path}")
+        else:
+            with os.fdopen(current, "rb") as existing:
+                if not stat.S_ISREG(os.fstat(existing.fileno()).st_mode) or existing.read() != old_bytes:
+                    raise ValueError(f"mutable output changed: {path}")
+        fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                     0o600, dir_fd=parent)
         with os.fdopen(fd, "w", encoding="utf-8") as out:
             yaml.safe_dump(obj, out, sort_keys=False)
             out.flush()
             os.fsync(out.fileno())
-    except BaseException:
-        path.unlink(missing_ok=True)
-        raise
+        os.replace(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+        os.fsync(parent)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+        os.close(parent)
 
 
 def require_frozen_files(repo: Path, paths: list[Path]) -> None:
-    relatives = []
+    revision = subprocess.check_output(["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
     for path in paths:
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"missing regular frozen input: {path}")
-        relative = str(path.relative_to(repo))
-        tracked = subprocess.run(["git", "-C", str(repo), "ls-files", "--error-unmatch", "--", relative], capture_output=True)
-        if tracked.returncode != 0:
-            raise ValueError(f"untracked frozen input: {relative}")
-        relatives.append(relative)
-    clean = subprocess.run(["git", "-C", str(repo), "diff", "--quiet", "HEAD", "--", *relatives])
-    if clean.returncode != 0:
-        raise ValueError("promotion inputs differ from frozen Git revision")
+        _frozen_bytes(repo, revision, str(path.relative_to(repo)))
 
 
-def verify_manifest_inputs(repo: Path, subject: str, manifest_path: Path, manifest: dict, packet: dict, summary: dict) -> None:
-    """Resolve pinned objects only through the expected subject directories."""
+def verify_manifest_inputs(repo: Path, subject: str, manifest_path: Path, manifest: dict, packet: dict, summary: dict) -> tuple[str, dict[str, tuple[Path, dict]]]:
+    """Return a single Git-bound snapshot of every promoted input."""
+    revision = subprocess.check_output(["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    packet_path = repo / "receipts" / "immutable" / subject / "promotion-readiness-packet.yaml"
+    summary_path = repo / "receipts" / "immutable" / subject / "promotion-readiness-summary.yaml"
+    for path, passed in ((manifest_path, manifest), (packet_path, packet), (summary_path, summary)):
+        frozen = yaml.safe_load(_frozen_bytes(repo, revision, str(path.relative_to(repo))))
+        if frozen != passed:
+            raise ValueError(f"promotion input differs from frozen Git revision: {path}")
     spec = manifest["spec"]
     packet_spec = packet["spec"]
     expected_manifest_id = f"pc.replay_manifest.{subject}.promotion-readiness"
@@ -84,36 +127,37 @@ def verify_manifest_inputs(repo: Path, subject: str, manifest_path: Path, manife
         repo / "canon" / "evidence_links" / subject,
         repo / "receipts" / "immutable" / subject,
     ]
-    found: dict[str, Path] = {}
+    found: dict[str, tuple[Path, dict]] = {}
+    snapshots: dict[str, bytes] = {}
     profile_path = repo / "control" / "admissibility" / "core-default.yaml"
-    profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    profile_bytes = _frozen_bytes(repo, revision, str(profile_path.relative_to(repo)))
+    profile = yaml.safe_load(profile_bytes)
     profile_id = profile["metadata"]["object_id"]
-    if spec["profile_refs"][0] != profile_id or profile_id not in refs:
+    if spec["profile_refs"] != [profile_id] or profile_id not in refs:
         raise ValueError("admissibility profile is not pinned by replay manifest")
-    found[profile_id] = profile_path
+    found[profile_id] = (profile_path, profile)
+    snapshots[profile_id] = profile_bytes
     for directory in allowed_dirs:
         for path in directory.glob("*.yaml"):
             if path.is_symlink() or not path.is_file():
                 raise ValueError(f"unsafe manifest input: {path}")
-            obj = yaml.safe_load(path.read_text(encoding="utf-8"))
+            data = _frozen_bytes(repo, revision, str(path.relative_to(repo)))
+            obj = yaml.safe_load(data)
             object_id = obj.get("metadata", {}).get("object_id") if isinstance(obj, dict) else None
             if object_id in pinned:
                 if object_id in found:
                     raise ValueError(f"duplicate pinned object: {object_id}")
-                found[object_id] = path
+                found[object_id] = (path, obj)
+                snapshots[object_id] = data
     if set(found) != set(refs):
         raise ValueError(f"missing pinned objects: {sorted(set(refs) - set(found))}")
-    for object_id, path in found.items():
-        if sha256_file(path) != pinned[object_id]:
+    for object_id, data in snapshots.items():
+        if hashlib.sha256(data).hexdigest() != pinned[object_id]:
             raise ValueError(f"replay manifest hash mismatch: {object_id}")
-    require_frozen_files(repo, list(found.values()) + [
-        manifest_path,
-        repo / "receipts" / "immutable" / subject / "promotion-readiness-packet.yaml",
-        repo / "receipts" / "immutable" / subject / "promotion-readiness-summary.yaml",
-    ])
     claim_refs = {ref for ref in refs if ref.startswith(f"pc.candidate_claim.{subject}.")}
     if claim_refs != set(packet_spec["target_refs"]):
         raise ValueError("packet targets differ from pinned claims")
+    return revision, found
 
 
 def evaluate_evidence(repo: Path, subject: str, claim: dict, profile: dict) -> tuple[list[str], list[str], list[str], list[str], bool]:
@@ -183,7 +227,8 @@ def evaluate_evidence(repo: Path, subject: str, claim: dict, profile: dict) -> t
     return met, unmet, reasons, unit_refs, replayable
 
 
-def verify_human_review(repo: Path, subject: str, manifest_path: Path, packet: dict, attestation_path: Path | None) -> str:
+def verify_human_review(repo: Path, subject: str, manifest_path: Path, packet: dict, attestation_path: Path | None,
+                        *, revision: str | None = None) -> tuple[str, str]:
     """Verify an externally signed, exact-revision human promotion decision.
 
     The public key is an explicit issuer binding. Without it promotion stays
@@ -193,26 +238,33 @@ def verify_human_review(repo: Path, subject: str, manifest_path: Path, packet: d
         raise ValueError("human review attestation required")
     binding_path = repo / "control" / "jurisdictions" / "human-reviewer.yaml"
     public_key = repo / "control" / "jurisdictions" / "human-reviewer.pub.pem"
-    if not public_key.is_file() or public_key.is_symlink():
-        raise ValueError("trusted human reviewer public key is not configured")
-    require_frozen_files(repo, [binding_path, public_key])
-    binding = yaml.safe_load(binding_path.read_text(encoding="utf-8"))["spec"]
+    if revision is None:
+        revision = subprocess.check_output(["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    try:
+        binding = yaml.safe_load(_frozen_bytes(repo, revision, str(binding_path.relative_to(repo))))["spec"]
+        key_bytes = _frozen_bytes(repo, revision, str(public_key.relative_to(repo)))
+    except ValueError as exc:
+        raise ValueError("trusted human reviewer public key is not configured") from exc
+    trusted_digest = os.environ.get("PRIME_HUMAN_REVIEWER_PUBLIC_KEY_SHA256", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", trusted_digest) or hashlib.sha256(key_bytes).hexdigest() != trusted_digest:
+        raise ValueError("human reviewer public key lacks an external trusted digest")
     if binding["actor_class"] != "human" or "promote" not in binding["allowed_actions"]:
         raise ValueError("human reviewer jurisdiction cannot promote")
     required = packet["spec"]["required_reviewer_classes"]
     if set(required) != {"human-reviewer"}:
         raise ValueError("unsupported required reviewer classes")
-    if attestation_path.is_symlink() or not attestation_path.is_file():
-        raise ValueError("missing regular review attestation")
-    attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+    try:
+        attestation_bytes = _read_regular_no_follow(attestation_path)
+    except OSError as exc:
+        raise ValueError("missing regular review attestation") from exc
+    attestation = json.loads(attestation_bytes)
     payload = attestation.get("payload")
     signature_hex = attestation.get("signature_hex")
     if not isinstance(payload, dict) or not isinstance(signature_hex, str) or not re.fullmatch(r"[0-9a-f]+", signature_hex):
         raise ValueError("invalid review attestation format")
-    revision = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
     expected = {
         "subject_slug": subject,
-        "manifest_sha256": sha256_file(manifest_path),
+        "manifest_sha256": hashlib.sha256(_frozen_bytes(repo, revision, str(manifest_path.relative_to(repo)))).hexdigest(),
         "frozen_git_revision": revision,
         "target_claim_refs": packet["spec"]["target_refs"],
         "reviewer_ref": binding["actor_ref"],
@@ -225,12 +277,14 @@ def verify_human_review(repo: Path, subject: str, manifest_path: Path, packet: d
     with tempfile.TemporaryDirectory() as temporary:
         data = Path(temporary) / "payload.json"
         signature = Path(temporary) / "signature.bin"
+        key = Path(temporary) / "reviewer.pub.pem"
         data.write_bytes(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
         signature.write_bytes(bytes.fromhex(signature_hex))
+        key.write_bytes(key_bytes)
         result = subprocess.run(
-            ["openssl", "dgst", "-sha256", "-verify", str(public_key), "-signature", str(signature), str(data)],
+            ["/usr/bin/openssl", "dgst", "-sha256", "-verify", str(key), "-signature", str(signature), str(data)],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
             raise ValueError("human reviewer signature did not verify")
-    return binding["actor_ref"]
+    return binding["actor_ref"], hashlib.sha256(attestation_bytes).hexdigest()

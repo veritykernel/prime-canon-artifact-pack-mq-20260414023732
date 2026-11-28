@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
-from publication_guard import validated_publication
+from publication_guard import open_trusted_destination_parent, validated_publication
 
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
@@ -12,6 +13,8 @@ def main() -> None:
 
     try:
         _, destination, source_sha = validated_publication(repo, subject_slug)
+        parent = open_trusted_destination_parent(destination)
+        os.close(parent)
     except (ValueError, KeyError, OSError) as exc:
         print("export_prep_ready=false")
         raise SystemExit(str(exc)) from exc

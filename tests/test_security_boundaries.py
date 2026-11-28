@@ -3,12 +3,14 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -18,6 +20,19 @@ sys.path.insert(0, str(REPO / "scripts"))
 from publication_guard import validated_publication
 from security_guards import evaluate_evidence, require_new_paths, verify_human_review, verify_manifest_inputs, write_new_yaml
 
+PUBLICATION_INPUTS = [
+    "views/rendered/subject-0001.md",
+    "views/current/subject-0001.yaml",
+    "receipts/immutable/subject-0001/render-execution.yaml",
+    "receipts/immutable/subject-0001/render-drift.yaml",
+    "control/render/render-profile.default.yaml",
+    "control/publish/publish-targets.default.yaml",
+    "control/render/render-order.default.yaml",
+    "control/render/render-targets.default.yaml",
+    "control/render/render-redaction.default.yaml",
+    *[f"canon/nodes/subject-0001/node-{seq:04d}.yaml" for seq in range(1, 6)],
+]
+
 
 def git(repo: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
@@ -25,14 +40,7 @@ def git(repo: Path, *args: str) -> None:
 
 class SecurityBoundaryTests(unittest.TestCase):
     def test_publisher_uses_frozen_bytes_and_holds_writable_stage(self):
-        paths = [
-            "views/rendered/subject-0001.md",
-            "views/current/subject-0001.yaml",
-            "receipts/immutable/subject-0001/render-execution.yaml",
-            "receipts/immutable/subject-0001/render-drift.yaml",
-            "control/render/render-profile.default.yaml",
-            "control/publish/publish-targets.default.yaml",
-        ]
+        paths = PUBLICATION_INPUTS
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory).resolve() / "repo"
             stage = Path(directory).resolve() / "stage"
@@ -41,7 +49,7 @@ class SecurityBoundaryTests(unittest.TestCase):
                 dest = repo / relative
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(REPO / relative, dest)
-            targets = repo / paths[-1]
+            targets = repo / "control/publish/publish-targets.default.yaml"
             target_data = yaml.safe_load(targets.read_text(encoding="utf-8"))
             destination = stage / "subject-0001.rendered.md"
             target_data["subjects"]["subject-0001"]["rendered_markdown_path"] = str(destination)
@@ -52,12 +60,25 @@ class SecurityBoundaryTests(unittest.TestCase):
             git(repo, "add", ".")
             git(repo, "commit", "-qm", "frozen inputs")
             command = [sys.executable, str(REPO / "scripts/publish_verified.py"), str(repo), "subject-0001"]
-            published = subprocess.run(command, capture_output=True, text=True)
+            publish_env = {**os.environ, "PRIME_PUBLISH_ROOT": str(stage)}
+            published = subprocess.run(command, capture_output=True, text=True, env=publish_env)
             self.assertEqual(published.returncode, 0, published.stderr)
             expected = (repo / paths[0]).read_bytes()
             self.assertEqual(destination.read_bytes(), expected)
+            target_data["subjects"]["subject-0001"]["rendered_markdown_path"] = str(repo / "important.txt")
+            targets.write_text(yaml.safe_dump(target_data), encoding="utf-8")
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "forged publish target")
+            outside = subprocess.run(command, capture_output=True, text=True, env=publish_env)
+            self.assertNotEqual(outside.returncode, 0)
+            self.assertIn("outside the operator-bound root", outside.stderr)
+            self.assertFalse((repo / "important.txt").exists())
+            target_data["subjects"]["subject-0001"]["rendered_markdown_path"] = str(destination)
+            targets.write_text(yaml.safe_dump(target_data), encoding="utf-8")
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "restore publish target")
             stage.chmod(0o775)
-            denied = subprocess.run(command, capture_output=True, text=True)
+            denied = subprocess.run(command, capture_output=True, text=True, env=publish_env)
             self.assertNotEqual(denied.returncode, 0)
             self.assertIn("writable publication directory", denied.stderr)
             self.assertEqual(destination.read_bytes(), expected)
@@ -65,19 +86,12 @@ class SecurityBoundaryTests(unittest.TestCase):
             destination.unlink()
             stage.rmdir()
             stage.symlink_to(repo, target_is_directory=True)
-            redirected = subprocess.run(command, capture_output=True, text=True)
+            redirected = subprocess.run(command, capture_output=True, text=True, env=publish_env)
             self.assertNotEqual(redirected.returncode, 0)
             self.assertFalse((repo / destination.name).exists())
 
     def test_publication_rechecks_source_bytes_and_git_state(self):
-        paths = [
-            "views/rendered/subject-0001.md",
-            "views/current/subject-0001.yaml",
-            "receipts/immutable/subject-0001/render-execution.yaml",
-            "receipts/immutable/subject-0001/render-drift.yaml",
-            "control/render/render-profile.default.yaml",
-            "control/publish/publish-targets.default.yaml",
-        ]
+        paths = PUBLICATION_INPUTS
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory).resolve()
             for relative in paths:
@@ -89,32 +103,66 @@ class SecurityBoundaryTests(unittest.TestCase):
             git(repo, "config", "user.email", "test@example.invalid")
             git(repo, "add", ".")
             git(repo, "commit", "-qm", "frozen inputs")
-            source, _, digest = validated_publication(repo, "subject-0001")
+            with patch.dict(os.environ, {"PRIME_PUBLISH_ROOT": "/Users/Shared/nuum-work/stage"}):
+                source, _, digest = validated_publication(repo, "subject-0001")
             self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), digest)
             source.write_text(source.read_text() + "\nchanged\n")
-            with self.assertRaisesRegex(ValueError, "frozen Git revision"):
-                validated_publication(repo, "subject-0001")
+            with patch.dict(os.environ, {"PRIME_PUBLISH_ROOT": "/Users/Shared/nuum-work/stage"}):
+                with self.assertRaisesRegex(ValueError, "frozen Git revision"):
+                    validated_publication(repo, "subject-0001")
             git(repo, "add", ".")
             git(repo, "commit", "-qm", "tampered output")
-            with self.assertRaisesRegex(ValueError, "source hash differs"):
-                validated_publication(repo, "subject-0001")
+            with patch.dict(os.environ, {"PRIME_PUBLISH_ROOT": "/Users/Shared/nuum-work/stage"}):
+                with self.assertRaisesRegex(ValueError, "source hash differs"):
+                    validated_publication(repo, "subject-0001")
+            forged_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+            for relative in ("receipts/immutable/subject-0001/render-execution.yaml",
+                             "receipts/immutable/subject-0001/render-drift.yaml"):
+                receipt_path = repo / relative
+                receipt = yaml.safe_load(receipt_path.read_text())
+                receipt["spec"]["output_sha256"] = forged_sha
+                receipt_path.write_text(yaml.safe_dump(receipt))
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "paired forged output and receipts")
+            with patch.dict(os.environ, {"PRIME_PUBLISH_ROOT": "/Users/Shared/nuum-work/stage"}):
+                with self.assertRaisesRegex(ValueError, "not derived from governed nodes"):
+                    validated_publication(repo, "subject-0001")
 
     def test_manifest_checks_every_pinned_input(self):
-        base = REPO / "receipts/immutable/subject-0001"
-        manifest = yaml.safe_load((REPO / "replay/manifests/subject-0001/promotion-readiness-replay.yaml").read_text())
-        packet = yaml.safe_load((base / "promotion-readiness-packet.yaml").read_text())
-        summary = yaml.safe_load((base / "promotion-readiness-summary.yaml").read_text())
-        profile_path = REPO / "control/admissibility/core-default.yaml"
-        profile_id = "pc.admissibility_profile.core-default"
-        manifest["spec"]["profile_refs"][0] = profile_id
-        manifest["spec"]["object_refs"].append(profile_id)
-        manifest["spec"]["input_hashes"].append({"object_ref": profile_id, "sha256": hashlib.sha256(profile_path.read_bytes()).hexdigest()})
-        manifest_path = REPO / "replay/manifests/subject-0001/promotion-readiness-replay.yaml"
-        verify_manifest_inputs(REPO, "subject-0001", manifest_path, manifest, packet, summary)
-        forged = copy.deepcopy(manifest)
-        forged["spec"]["input_hashes"][0]["sha256"] = "0" * 64
-        with self.assertRaisesRegex(ValueError, "hash mismatch"):
-            verify_manifest_inputs(REPO, "subject-0001", manifest_path, forged, packet, summary)
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            subprocess.run(["/usr/bin/git", "clone", "-q", "--no-local", str(REPO), str(repo)], check=True)
+            git(repo, "config", "user.name", "Test")
+            git(repo, "config", "user.email", "test@example.invalid")
+            base = repo / "receipts/immutable/subject-0001"
+            manifest_path = repo / "replay/manifests/subject-0001/promotion-readiness-replay.yaml"
+            manifest = yaml.safe_load(manifest_path.read_text())
+            packet = yaml.safe_load((base / "promotion-readiness-packet.yaml").read_text())
+            summary = yaml.safe_load((base / "promotion-readiness-summary.yaml").read_text())
+            profile_path = repo / "control/admissibility/core-default.yaml"
+            profile_id = "pc.admissibility_profile.core-default"
+            manifest["spec"]["profile_refs"] = [profile_id]
+            manifest["spec"]["object_refs"].append(profile_id)
+            manifest["spec"]["input_hashes"].append({"object_ref": profile_id, "sha256": hashlib.sha256(profile_path.read_bytes()).hexdigest()})
+            manifest_path.write_text(yaml.safe_dump(manifest, sort_keys=False))
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "pin admissibility profile")
+            _, pinned = verify_manifest_inputs(repo, "subject-0001", manifest_path, manifest, packet, summary)
+            claim_id = "pc.candidate_claim.subject-0001.0001"
+            claim_path, pinned_claim = pinned[claim_id]
+            original_claim = claim_path.read_bytes()
+            claim_path.write_bytes(original_claim.replace(b"Conversation is ingress", b"Forged conversation ingress"))
+            self.assertIn("Conversation is ingress", pinned_claim["spec"]["normalized_claim_body"])
+            with self.assertRaisesRegex(ValueError, "frozen Git revision"):
+                verify_manifest_inputs(repo, "subject-0001", manifest_path, manifest, packet, summary)
+            claim_path.write_bytes(original_claim)
+            forged = copy.deepcopy(manifest)
+            forged["spec"]["input_hashes"][0]["sha256"] = "0" * 64
+            manifest_path.write_text(yaml.safe_dump(forged, sort_keys=False))
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "forged input hash")
+            with self.assertRaisesRegex(ValueError, "hash mismatch"):
+                verify_manifest_inputs(repo, "subject-0001", manifest_path, forged, packet, summary)
 
     def test_burden_uses_source_units_and_blocks_high_profile(self):
         claim = yaml.safe_load((REPO / "canon/candidate_claims/subject-0001/claim-0001.yaml").read_text())
@@ -152,6 +200,13 @@ class SecurityBoundaryTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 write_new_yaml(target, {"proof": "replacement"})
             self.assertEqual(yaml.safe_load(target.read_text()), {"proof": "first"})
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            redirect = Path(directory) / "redirect"
+            redirect.symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(OSError):
+                write_new_yaml(redirect / "escaped.yaml", {"proof": "forged"})
+            self.assertFalse((outside / "escaped.yaml").exists())
 
     def test_human_signature_binds_manifest_targets_and_revision(self):
         if shutil.which("openssl") is None:
@@ -183,10 +238,24 @@ class SecurityBoundaryTests(unittest.TestCase):
             subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(private_key), "-out", str(signature), str(data)], check=True, capture_output=True)
             attestation = repo / "attestation.json"
             attestation.write_text(json.dumps({"payload": payload, "signature_hex": signature.read_bytes().hex()}))
-            self.assertEqual(verify_human_review(repo, "subject-0001", manifest, packet, attestation), "human:reviewer")
-            packet["spec"]["target_refs"] = ["other-claim"]
-            with self.assertRaisesRegex(ValueError, "not bound"):
-                verify_human_review(repo, "subject-0001", manifest, packet, attestation)
+            trusted = hashlib.sha256(public_key.read_bytes()).hexdigest()
+            with patch.dict(os.environ, {"PRIME_HUMAN_REVIEWER_PUBLIC_KEY_SHA256": trusted}):
+                reviewer, attestation_sha = verify_human_review(repo, "subject-0001", manifest, packet, attestation)
+                self.assertEqual(reviewer, "human:reviewer")
+                self.assertEqual(attestation_sha, hashlib.sha256(attestation.read_bytes()).hexdigest())
+                packet["spec"]["target_refs"] = ["other-claim"]
+                with self.assertRaisesRegex(ValueError, "not bound"):
+                    verify_human_review(repo, "subject-0001", manifest, packet, attestation)
+                packet["spec"]["target_refs"] = ["claim-1"]
+                attestation.write_text(json.dumps({"payload": payload, "signature_hex": "00"}))
+                fakebin = repo / "fakebin"
+                fakebin.mkdir()
+                fake = fakebin / "openssl"
+                fake.write_text("#!/bin/sh\nexit 0\n")
+                fake.chmod(0o755)
+                with patch.dict(os.environ, {"PATH": f"{fakebin}:{os.environ.get('PATH', '')}"}):
+                    with self.assertRaisesRegex(ValueError, "signature did not verify"):
+                        verify_human_review(repo, "subject-0001", manifest, packet, attestation)
 
 
 if __name__ == "__main__":

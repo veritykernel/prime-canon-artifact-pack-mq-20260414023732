@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,7 +11,8 @@ from pathlib import Path
 import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
-from security_guards import require_new_paths, sha256_file, verify_human_review, verify_manifest_inputs, write_new_yaml
+from publication_guard import _frozen_bytes, _read_regular_no_follow
+from security_guards import replace_yaml_if_unchanged, require_new_paths, verify_human_review, verify_manifest_inputs, write_new_yaml
 
 NODE_KIND = "PRIME_CANON_NODE_V1"
 VIEW_KIND = "PRIME_CANON_CURRENT_STATE_VIEW_V1"
@@ -27,7 +30,9 @@ def claim_seq_from_path(path: Path) -> str:
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
     subject_slug = sys.argv[2] if len(sys.argv) > 2 else "subject-0001"
-    review_attestation = Path(sys.argv[3]).resolve() if len(sys.argv) > 3 else None
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", subject_slug):
+        raise SystemExit("invalid subject slug")
+    review_attestation = Path(sys.argv[3]) if len(sys.argv) > 3 else None
 
     corpus_index_path = repo / "canon" / "corpora" / subject_slug / "index.yaml"
     claim_dir = repo / "canon" / "candidate_claims" / subject_slug
@@ -52,23 +57,28 @@ def main() -> None:
     if not replay_manifest_path.exists():
         raise SystemExit(f"missing replay manifest: {replay_manifest_path}")
 
-    corpus = yaml.safe_load(corpus_index_path.read_text(encoding="utf-8"))
-    packet = yaml.safe_load(packet_path.read_text(encoding="utf-8"))
-    readiness_summary = yaml.safe_load(readiness_summary_path.read_text(encoding="utf-8"))
-    replay_manifest = yaml.safe_load(replay_manifest_path.read_text(encoding="utf-8"))
+    revision = subprocess.check_output(["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    corpus_old_bytes = _frozen_bytes(repo, revision, str(corpus_index_path.relative_to(repo)))
+    packet_bytes = _frozen_bytes(repo, revision, str(packet_path.relative_to(repo)))
+    summary_bytes = _frozen_bytes(repo, revision, str(readiness_summary_path.relative_to(repo)))
+    manifest_bytes = _frozen_bytes(repo, revision, str(replay_manifest_path.relative_to(repo)))
+    corpus = yaml.safe_load(corpus_old_bytes)
+    packet = yaml.safe_load(packet_bytes)
+    readiness_summary = yaml.safe_load(summary_bytes)
+    replay_manifest = yaml.safe_load(manifest_bytes)
 
     if packet["spec"]["ready"] is not True:
         raise SystemExit("promotion readiness packet is not ready=true")
     if packet["spec"].get("blockers"):
         raise SystemExit(f"promotion readiness packet still has blockers: {packet['spec']['blockers']}")
     try:
-        verify_manifest_inputs(repo, subject_slug, replay_manifest_path, replay_manifest, packet, readiness_summary)
-        reviewer_ref = verify_human_review(repo, subject_slug, replay_manifest_path, packet, review_attestation)
+        verified_revision, pinned = verify_manifest_inputs(repo, subject_slug, replay_manifest_path, replay_manifest, packet, readiness_summary)
+        if verified_revision != revision:
+            raise ValueError("promotion revision changed during verification")
+        reviewer_ref, attestation_digest = verify_human_review(
+            repo, subject_slug, replay_manifest_path, packet, review_attestation, revision=revision)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-
-    node_dir.mkdir(parents=True, exist_ok=True)
-    current_view_path.parent.mkdir(parents=True, exist_ok=True)
 
     corpus_id = corpus["spec"]["corpus_id"]
     now = utc_now()
@@ -77,17 +87,17 @@ def main() -> None:
     readiness_summary_id = readiness_summary["metadata"]["object_id"]
     replay_manifest_id = replay_manifest["metadata"]["object_id"]
 
-    claim_paths_by_id = {}
-    for path in sorted(claim_dir.glob("claim-*.yaml")):
-        if path.is_file():
-            claim = yaml.safe_load(path.read_text(encoding="utf-8"))
-            claim_paths_by_id[claim["spec"]["claim_id"]] = path
+    claim_paths_by_id = {
+        object_id: (path, obj) for object_id, (path, obj) in pinned.items()
+        if object_id.startswith(f"pc.candidate_claim.{subject_slug}.")
+    }
 
     evidence_links_by_claim = {}
-    for path in sorted(evidence_dir.glob("link-*.yaml")):
-        if path.is_file():
-            link = yaml.safe_load(path.read_text(encoding="utf-8"))
+    for object_id, (path, link) in pinned.items():
+        if object_id.startswith(f"pc.evidence_link.{subject_slug}."):
             claim_ref = link["spec"]["claim_ref"]
+            if claim_ref in evidence_links_by_claim:
+                raise SystemExit(f"duplicate evidence link for claim: {claim_ref}")
             evidence_links_by_claim[claim_ref] = link
 
     missing_claims = [claim_id for claim_id in target_claim_ids if claim_id not in claim_paths_by_id]
@@ -98,8 +108,9 @@ def main() -> None:
     if missing_links:
         raise SystemExit(f"missing evidence links for target refs: {missing_links}")
 
-    receipt_paths = [repo / "receipts" / "immutable" / subject_slug / f"promotion-node-{claim_seq_from_path(claim_paths_by_id[c])}.yaml" for c in target_claim_ids]
+    receipt_paths = [repo / "receipts" / "immutable" / subject_slug / f"promotion-node-{claim_seq_from_path(claim_paths_by_id[c][0])}.yaml" for c in target_claim_ids]
     receipt_paths.append(receipt_dir / "promotion-lane-summary.yaml")
+    receipt_paths.extend(node_dir / f"node-{claim_seq_from_path(claim_paths_by_id[c][0])}.yaml" for c in target_claim_ids)
     try:
         require_new_paths(receipt_paths)
     except ValueError as exc:
@@ -111,8 +122,7 @@ def main() -> None:
     all_source_unit_refs = []
 
     for claim_id in target_claim_ids:
-        claim_path = claim_paths_by_id[claim_id]
-        claim = yaml.safe_load(claim_path.read_text(encoding="utf-8"))
+        claim_path, claim = claim_paths_by_id[claim_id]
         seq = claim_seq_from_path(claim_path)
         link = evidence_links_by_claim[claim_id]
         link_id = link["metadata"]["object_id"]
@@ -209,7 +219,7 @@ def main() -> None:
                 "deciding_surface": choose_enum(repo, RECEIPT_KIND, "deciding_surface", "human", "ci"),
                 "rationale": f"claim {claim_id} promoted into canon node {node_id} from ready promotion packet {packet_id}",
                 "cited_receipt_refs": [packet_id, readiness_summary_id],
-                "cited_object_refs": [claim_id, link_id, replay_manifest_id, f"sha256:{sha256_file(review_attestation)}"],
+                "cited_object_refs": [claim_id, link_id, replay_manifest_id, f"sha256:{attestation_digest}"],
                 "jurisdiction_ref": "pc.jurisdiction.human-reviewer",
                 "reviewer_refs": [reviewer_ref],
                 "blocker_state": choose_enum(repo, RECEIPT_KIND, "blocker_state", "none", "present_resolved"),
@@ -308,7 +318,7 @@ def main() -> None:
         validate_instance(repo, node)
 
         write_new_yaml(repo / receipt_rel_path, receipt)
-        (repo / node_rel_path).write_text(yaml.safe_dump(node, sort_keys=False), encoding="utf-8")
+        write_new_yaml(repo / node_rel_path, node)
 
         node_ids.append(node_id)
         node_receipt_ids.append(receipt_id)
@@ -464,7 +474,7 @@ def main() -> None:
             "deciding_surface": choose_enum(repo, RECEIPT_KIND, "deciding_surface", "human", "ci"),
             "rationale": f"promoted {len(node_ids)} ready candidate claims into canon nodes and generated current state view {view_id}",
             "cited_receipt_refs": node_receipt_ids + [packet_id, readiness_summary_id],
-            "cited_object_refs": target_claim_ids + node_ids + [view_id, replay_manifest_id, f"sha256:{sha256_file(review_attestation)}"],
+            "cited_object_refs": target_claim_ids + node_ids + [view_id, replay_manifest_id, f"sha256:{attestation_digest}"],
             "jurisdiction_ref": "pc.jurisdiction.human-reviewer",
             "reviewer_refs": [reviewer_ref],
             "blocker_state": choose_enum(repo, RECEIPT_KIND, "blocker_state", "none", "present_resolved"),
@@ -475,14 +485,15 @@ def main() -> None:
     ensure_required_fields(repo, RECEIPT_KIND, lane_summary["spec"])
     validate_instance(repo, lane_summary)
 
-    (repo / view_rel_path).write_text(yaml.safe_dump(current_view, sort_keys=False), encoding="utf-8")
+    old_view_bytes = _read_regular_no_follow(current_view_path) if current_view_path.exists() else None
+    replace_yaml_if_unchanged(current_view_path, current_view, old_view_bytes)
     write_new_yaml(repo / lane_summary_rel_path, lane_summary)
 
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["temporal"]["reduced_at"] = now
     corpus["attributes"]["temporal"]["status_since"] = now
     corpus["attributes"]["operational"]["route_destination"] = "render-projection"
-    corpus_index_path.write_text(yaml.safe_dump(corpus, sort_keys=False), encoding="utf-8")
+    replace_yaml_if_unchanged(corpus_index_path, corpus, corpus_old_bytes)
 
     print(view_id)
     print(f"promoted_nodes={len(node_ids)}")
