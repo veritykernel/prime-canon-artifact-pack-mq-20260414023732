@@ -18,6 +18,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 
 from publication_guard import validated_publication
+from schema_contract import bind_frozen_bundle, bundle
 from security_guards import evaluate_evidence, require_new_paths, verify_human_review, verify_manifest_inputs, write_new_yaml
 
 PUBLICATION_INPUTS = [
@@ -189,6 +190,24 @@ class SecurityBoundaryTests(unittest.TestCase):
             _, unmet, _, _, replayable = evaluate_evidence(repo, "subject-0001", claim, profile)
             self.assertIn("replayability", unmet)
             self.assertFalse(replayable)
+
+    def test_promotion_schema_remains_on_frozen_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            schema = repo / "schemas/prime-canon-bundle.schema.json"
+            schema.parent.mkdir(parents=True)
+            shutil.copy2(REPO / "schemas/prime-canon-bundle.schema.json", schema)
+            git(repo, "init", "-q")
+            git(repo, "config", "user.name", "Test")
+            git(repo, "config", "user.email", "test@example.invalid")
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "frozen schema")
+            revision = subprocess.check_output(["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            bind_frozen_bundle(repo, revision)
+            original = bundle(repo)
+            schema.write_text("{}")
+            self.assertEqual(bundle(repo), original)
+            self.assertIn("PRIME_CANON_NODE_V1", bundle(repo)["$defs"])
 
     def test_immutable_write_refuses_existing_path(self):
         with tempfile.TemporaryDirectory() as directory:

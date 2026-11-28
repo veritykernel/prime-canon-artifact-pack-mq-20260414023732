@@ -10,7 +10,7 @@ from pathlib import Path
 
 import yaml
 
-from schema_contract import choose_enum, ensure_required_fields, validate_instance
+from schema_contract import bind_frozen_bundle, choose_enum, ensure_required_fields, validate_instance
 from publication_guard import _frozen_bytes, _read_regular_no_follow
 from security_guards import replace_yaml_if_unchanged, require_new_paths, verify_human_review, verify_manifest_inputs, write_new_yaml
 
@@ -58,6 +58,7 @@ def main() -> None:
         raise SystemExit(f"missing replay manifest: {replay_manifest_path}")
 
     revision = subprocess.check_output(["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    bind_frozen_bundle(repo, revision)
     corpus_old_bytes = _frozen_bytes(repo, revision, str(corpus_index_path.relative_to(repo)))
     packet_bytes = _frozen_bytes(repo, revision, str(packet_path.relative_to(repo)))
     summary_bytes = _frozen_bytes(repo, revision, str(readiness_summary_path.relative_to(repo)))
