@@ -96,6 +96,22 @@ CI:
 
 - `.github/workflows/validate-prime-canon.yml`
 
+## Promotion review trust
+
+Promotion requires a signed review attestation and a public key at
+`control/jurisdictions/human-reviewer.pub.pem`. The operator must supply
+`PRIME_HUMAN_REVIEWER_PUBLIC_KEY_SHA256` from an independently trusted issuer
+record. The 64-character lowercase digest must match the committed key. A key
+or digest copied from the candidate checkout alone is not review authority.
+Promotion remains closed when either binding is absent or mismatched.
+
+Publication requires `PRIME_PUBLISH_ROOT` from the operator's environment.
+The committed publish target must be exactly
+`$PRIME_PUBLISH_ROOT/<subject>.rendered.md`; the directory must have trusted
+non-writable ancestors. The source projection is replayed from frozen nodes
+before publication. The operator-bound root must come from outside the
+candidate checkout.
+
 ## Suggested first implementation sequence
 
 1. Freeze `control/` and `schemas/`.

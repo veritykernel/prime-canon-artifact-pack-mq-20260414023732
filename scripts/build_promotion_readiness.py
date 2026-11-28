@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
+from security_guards import require_new_paths, write_new_yaml
 
 PACKET_KIND = "PRIME_CANON_PROMOTION_READINESS_PACKET_V1"
 MANIFEST_KIND = "PRIME_CANON_REPLAY_MANIFEST_V1"
@@ -42,6 +43,14 @@ def main() -> None:
     supersession_dir = repo / "canon" / "supersession" / subject_slug
     receipt_dir = repo / "receipts" / "immutable" / subject_slug
     replay_dir = repo / "replay" / "manifests" / subject_slug
+    try:
+        require_new_paths([
+            replay_dir / "promotion-readiness-replay.yaml",
+            receipt_dir / "promotion-readiness-packet.yaml",
+            receipt_dir / "promotion-readiness-summary.yaml",
+        ])
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     if not corpus_index_path.exists():
         raise SystemExit(f"missing corpus index: {corpus_index_path}")
@@ -184,6 +193,15 @@ def main() -> None:
     for receipt_id, path in admissibility_paths_by_id.items():
         object_ref_paths[receipt_id] = path
     object_ref_paths[topology_receipt_id] = topology_receipt_path
+    profile_path = repo / "control" / "admissibility" / "core-default.yaml"
+    profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    profile_id = profile["metadata"]["object_id"]
+    repo_manifest = yaml.safe_load((repo / "control" / "repo.manifest.yaml").read_text(encoding="utf-8"))
+    if repo_manifest["spec"]["default_admissibility_profile_ref"] != profile_id or profile["spec"]["profile_id"] != profile_id:
+        raise SystemExit("default admissibility profile identity mismatch")
+    if any(decision["spec"].get("profile_ref") != profile_id for decision in admissibility_by_claim.values()):
+        raise SystemExit("admissibility decisions do not match configured profile")
+    object_ref_paths[profile_id] = profile_path
 
     input_hashes = []
     for object_ref in sorted(object_ref_paths):
@@ -257,7 +275,7 @@ def main() -> None:
             "scope_ref": corpus_id,
             "object_refs": sorted(object_ref_paths.keys()),
             "profile_refs": [
-                "pc.admissibility.default.v1",
+                profile_id,
                 "pc.promotion.default.v1",
             ],
             "compiler_refs": [
@@ -460,9 +478,14 @@ def main() -> None:
     ensure_required_fields(repo, RECEIPT_KIND, summary_receipt["spec"])
     validate_instance(repo, summary_receipt)
 
-    (repo / manifest_rel_path).write_text(yaml.safe_dump(replay_manifest, sort_keys=False), encoding="utf-8")
-    (repo / packet_rel_path).write_text(yaml.safe_dump(promotion_packet, sort_keys=False), encoding="utf-8")
-    (repo / summary_rel_path).write_text(yaml.safe_dump(summary_receipt, sort_keys=False), encoding="utf-8")
+    output_paths = [repo / manifest_rel_path, repo / packet_rel_path, repo / summary_rel_path]
+    try:
+        require_new_paths(output_paths)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    write_new_yaml(output_paths[0], replay_manifest)
+    write_new_yaml(output_paths[1], promotion_packet)
+    write_new_yaml(output_paths[2], summary_receipt)
 
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["temporal"]["reduced_at"] = now

@@ -8,6 +8,15 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+_BOUND_BUNDLES: dict[str, dict[str, Any]] = {}
+
+
+def bind_frozen_bundle(repo_root: Path, revision: str) -> None:
+    """Keep promotion validation on the same committed schema revision as its inputs."""
+    from publication_guard import _frozen_bytes
+    data = _frozen_bytes(repo_root, revision, "schemas/prime-canon-bundle.schema.json")
+    _BOUND_BUNDLES[str(repo_root.resolve())] = json.loads(data)
+
 @lru_cache(maxsize=None)
 def _load_bundle(bundle_path_str: str) -> dict[str, Any]:
     return json.loads(Path(bundle_path_str).read_text(encoding="utf-8"))
@@ -16,7 +25,8 @@ def bundle_path(repo_root: Path) -> Path:
     return (repo_root / "schemas" / "prime-canon-bundle.schema.json").resolve()
 
 def bundle(repo_root: Path) -> dict[str, Any]:
-    return _load_bundle(str(bundle_path(repo_root)))
+    key = str(repo_root.resolve())
+    return _BOUND_BUNDLES[key] if key in _BOUND_BUNDLES else _load_bundle(str(bundle_path(repo_root)))
 
 def object_schema(repo_root: Path, kind: str) -> dict[str, Any]:
     defs = bundle(repo_root).get("$defs", {})

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from security_guards import require_new_paths, write_new_yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
 
@@ -294,6 +295,10 @@ def main() -> None:
     contradiction_dir = repo / "canon" / "contradictions" / subject_slug
     supersession_dir = repo / "canon" / "supersession" / subject_slug
     receipt_dir = repo / "receipts" / "immutable" / subject_slug
+    try:
+        require_new_paths([receipt_dir / "topology-scout-summary.yaml"])
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     corpus_index_path = repo / "canon" / "corpora" / subject_slug / "index.yaml"
 
     if not claim_dir.exists():
@@ -397,7 +402,7 @@ def main() -> None:
         route_destination = "promotion-readiness"
 
     receipt = build_receipt(repo, subject_slug, corpus_id, now, route_outcome, blocker_state, rationale, cited_receipt_refs, cited_object_refs)
-    (repo / receipt["attributes"]["identity"]["canonical_home"]).write_text(yaml.safe_dump(receipt, sort_keys=False), encoding="utf-8")
+    write_new_yaml(repo / receipt["attributes"]["identity"]["canonical_home"], receipt)
 
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["temporal"]["reduced_at"] = now

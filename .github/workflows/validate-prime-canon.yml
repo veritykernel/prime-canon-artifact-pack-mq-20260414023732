@@ -10,7 +10,9 @@ on:
       - "replay/**"
       - "views/**"
       - "schemas/**"
-      - "scripts/validate_pack.py"
+      - "scripts/**"
+      - "tests/**"
+      - ".github/workflows/**"
 
 jobs:
   validate:
@@ -26,3 +28,7 @@ jobs:
           python -m pip install pyyaml jsonschema
       - name: Validate prime canon pack
         run: python scripts/validate_pack.py .
+      - name: Verify frozen publication source
+        run: python scripts/check_publication_source.py . subject-0001
+      - name: Test canon security boundaries
+        run: PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v
