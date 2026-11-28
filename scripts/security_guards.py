@@ -92,6 +92,19 @@ def require_frozen_files(repo: Path, paths: list[Path]) -> None:
         _frozen_bytes(repo, revision, str(path.relative_to(repo)))
 
 
+def require_current_clean_revision(repo: Path, revision: str) -> None:
+    """Reject a changed checkout before the first promotion write."""
+    current = subprocess.check_output(["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    if current != revision:
+        raise ValueError("signed promotion revision is no longer current")
+    status = subprocess.run(
+        ["/usr/bin/git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    if status:
+        raise ValueError("promotion worktree is not clean at write boundary")
+
+
 def verify_manifest_inputs(repo: Path, subject: str, manifest_path: Path, manifest: dict, packet: dict, summary: dict) -> tuple[str, dict[str, tuple[Path, dict]]]:
     """Return a single Git-bound snapshot of every promoted input."""
     revision = subprocess.check_output(["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()

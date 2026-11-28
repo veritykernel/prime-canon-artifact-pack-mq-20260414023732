@@ -12,7 +12,7 @@ import yaml
 
 from schema_contract import bind_frozen_bundle, choose_enum, ensure_required_fields, validate_instance
 from publication_guard import _frozen_bytes, _read_regular_no_follow
-from security_guards import replace_yaml_if_unchanged, require_new_paths, verify_human_review, verify_manifest_inputs, write_new_yaml
+from security_guards import replace_yaml_if_unchanged, require_current_clean_revision, require_new_paths, verify_human_review, verify_manifest_inputs, write_new_yaml
 
 NODE_KIND = "PRIME_CANON_NODE_V1"
 VIEW_KIND = "PRIME_CANON_CURRENT_STATE_VIEW_V1"
@@ -121,6 +121,7 @@ def main() -> None:
     node_receipt_ids = []
     all_source_refs = []
     all_source_unit_refs = []
+    pending_writes: list[tuple[Path, dict]] = []
 
     for claim_id in target_claim_ids:
         claim_path, claim = claim_paths_by_id[claim_id]
@@ -318,8 +319,7 @@ def main() -> None:
         ensure_required_fields(repo, NODE_KIND, node["spec"])
         validate_instance(repo, node)
 
-        write_new_yaml(repo / receipt_rel_path, receipt)
-        write_new_yaml(repo / node_rel_path, node)
+        pending_writes.extend(((repo / receipt_rel_path, receipt), (repo / node_rel_path, node)))
 
         node_ids.append(node_id)
         node_receipt_ids.append(receipt_id)
@@ -486,14 +486,17 @@ def main() -> None:
     ensure_required_fields(repo, RECEIPT_KIND, lane_summary["spec"])
     validate_instance(repo, lane_summary)
 
-    old_view_bytes = _read_regular_no_follow(current_view_path) if current_view_path.exists() else None
-    replace_yaml_if_unchanged(current_view_path, current_view, old_view_bytes)
-    write_new_yaml(repo / lane_summary_rel_path, lane_summary)
-
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["temporal"]["reduced_at"] = now
     corpus["attributes"]["temporal"]["status_since"] = now
     corpus["attributes"]["operational"]["route_destination"] = "render-projection"
+    old_view_bytes = _read_regular_no_follow(current_view_path) if current_view_path.exists() else None
+    pending_writes.append((repo / lane_summary_rel_path, lane_summary))
+    require_new_paths([path for path, _ in pending_writes])
+    require_current_clean_revision(repo, revision)
+    for path, obj in pending_writes:
+        write_new_yaml(path, obj)
+    replace_yaml_if_unchanged(current_view_path, current_view, old_view_bytes)
     replace_yaml_if_unchanged(corpus_index_path, corpus, corpus_old_bytes)
 
     print(view_id)

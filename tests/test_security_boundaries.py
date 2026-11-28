@@ -19,7 +19,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 from publication_guard import validated_publication
 from schema_contract import bind_frozen_bundle, bundle
-from security_guards import evaluate_evidence, require_new_paths, verify_human_review, verify_manifest_inputs, write_new_yaml
+from security_guards import evaluate_evidence, require_current_clean_revision, require_new_paths, verify_human_review, verify_manifest_inputs, write_new_yaml
 
 PUBLICATION_INPUTS = [
     "views/rendered/subject-0001.md",
@@ -208,6 +208,27 @@ class SecurityBoundaryTests(unittest.TestCase):
             schema.write_text("{}")
             self.assertEqual(bundle(repo), original)
             self.assertIn("PRIME_CANON_NODE_V1", bundle(repo)["$defs"])
+
+    def test_promotion_rejects_commit_switch_and_dirty_checkout_before_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            marker = repo / "README.md"
+            marker.write_text("first\n")
+            git(repo, "init", "-q")
+            git(repo, "config", "user.name", "Test")
+            git(repo, "config", "user.email", "test@example.invalid")
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "first")
+            signed = subprocess.check_output(["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            require_current_clean_revision(repo, signed)
+            marker.write_text("second\n")
+            with self.assertRaisesRegex(ValueError, "worktree is not clean"):
+                require_current_clean_revision(repo, signed)
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "unrelated concurrent change")
+            with self.assertRaisesRegex(ValueError, "revision is no longer current"):
+                require_current_clean_revision(repo, signed)
 
     def test_immutable_write_refuses_existing_path(self):
         with tempfile.TemporaryDirectory() as directory:
