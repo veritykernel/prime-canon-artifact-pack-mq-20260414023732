@@ -496,8 +496,8 @@ def main() -> None:
     require_current_clean_revision(repo, revision)
     for path, obj in pending_writes:
         write_new_yaml(path, obj)
-    replace_yaml_if_unchanged(current_view_path, current_view, old_view_bytes)
     replace_yaml_if_unchanged(corpus_index_path, corpus, corpus_old_bytes)
+    replace_yaml_if_unchanged(current_view_path, current_view, old_view_bytes)
 
     print(view_id)
     print(f"promoted_nodes={len(node_ids)}")

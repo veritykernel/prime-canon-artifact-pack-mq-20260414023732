@@ -18,6 +18,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 
 from publication_guard import validated_publication
+import promote_nodes_and_current_state as promoter
 from schema_contract import bind_frozen_bundle, bundle
 from security_guards import evaluate_evidence, require_current_clean_revision, require_new_paths, verify_human_review, verify_manifest_inputs, write_new_yaml
 
@@ -37,6 +38,29 @@ PUBLICATION_INPUTS = [
 
 def git(repo: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+
+def promotion_fixture(directory: str, *, retain_view: bool = False) -> tuple[Path, dict, str]:
+    """A disposable clean commit with fresh output paths and existing inputs."""
+    repo = (Path(directory) / "repo").resolve()
+    subprocess.run(["/usr/bin/git", "clone", "-q", "--no-local", str(REPO), str(repo)], check=True)
+    git(repo, "config", "user.name", "Test")
+    git(repo, "config", "user.email", "test@example.invalid")
+    for path in (repo / "receipts/immutable/subject-0001").glob("promotion-node-*.yaml"):
+        path.unlink()
+    (repo / "receipts/immutable/subject-0001/promotion-lane-summary.yaml").unlink()
+    shutil.rmtree(repo / "canon/nodes/subject-0001")
+    if not retain_view:
+        (repo / "views/current/subject-0001.yaml").unlink()
+    git(repo, "add", "-u")
+    git(repo, "commit", "-qm", "clear disposable promotion outputs")
+    revision = subprocess.check_output(["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    pinned = {}
+    for directory_name in ("canon/candidate_claims/subject-0001", "canon/evidence_links/subject-0001"):
+        for path in (repo / directory_name).glob("*.yaml"):
+            obj = yaml.safe_load(path.read_text())
+            pinned[obj["metadata"]["object_id"]] = path, obj
+    return repo, pinned, revision
 
 
 class SecurityBoundaryTests(unittest.TestCase):
@@ -229,6 +253,54 @@ class SecurityBoundaryTests(unittest.TestCase):
             git(repo, "commit", "-qm", "unrelated concurrent change")
             with self.assertRaisesRegex(ValueError, "revision is no longer current"):
                 require_current_clean_revision(repo, signed)
+
+    def test_promoter_current_view_stays_old_when_corpus_update_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, pinned, revision = promotion_fixture(directory, retain_view=True)
+            corpus = repo / "canon/corpora/subject-0001/index.yaml"
+            before = corpus.read_bytes()
+            view = repo / "views/current/subject-0001.yaml"
+            prior_view = view.read_bytes()
+            real_replace = promoter.replace_yaml_if_unchanged
+
+            def fail_corpus(path: Path, obj: dict, old_bytes: bytes | None) -> None:
+                if path == corpus:
+                    raise ValueError("injected corpus failure")
+                real_replace(path, obj, old_bytes)
+
+            with patch.object(sys, "argv", ["promote", str(repo), "subject-0001"]), \
+                 patch.object(promoter, "verify_manifest_inputs", return_value=(revision, pinned)), \
+                 patch.object(promoter, "verify_human_review", return_value=("human:reviewer", "0" * 64)), \
+                 patch.object(promoter, "replace_yaml_if_unchanged", side_effect=fail_corpus):
+                with self.assertRaisesRegex(ValueError, "injected corpus failure"):
+                    promoter.main()
+            self.assertEqual(view.read_bytes(), prior_view)
+            self.assertEqual(corpus.read_bytes(), before)
+
+    def test_promoter_mid_build_commit_writes_no_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, pinned, revision = promotion_fixture(directory)
+            real_require = promoter.require_new_paths
+            calls = 0
+
+            def switch_head(paths: list[Path]) -> None:
+                nonlocal calls
+                calls += 1
+                real_require(paths)
+                if calls == 2:
+                    marker = repo / "README.md"
+                    marker.write_text(marker.read_text() + "\nconcurrent change\n")
+                    git(repo, "add", "README.md")
+                    git(repo, "commit", "-qm", "post verification checkout change")
+
+            with patch.object(sys, "argv", ["promote", str(repo), "subject-0001"]), \
+                 patch.object(promoter, "verify_manifest_inputs", return_value=(revision, pinned)), \
+                 patch.object(promoter, "verify_human_review", return_value=("human:reviewer", "0" * 64)), \
+                 patch.object(promoter, "require_new_paths", side_effect=switch_head):
+                with self.assertRaisesRegex(ValueError, "revision is no longer current"):
+                    promoter.main()
+            self.assertFalse((repo / "canon/nodes/subject-0001").exists())
+            self.assertFalse((repo / "views/current/subject-0001.yaml").exists())
 
     def test_immutable_write_refuses_existing_path(self):
         with tempfile.TemporaryDirectory() as directory:
